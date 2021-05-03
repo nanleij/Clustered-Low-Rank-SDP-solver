@@ -8,6 +8,7 @@ Functions include
 - `solvempmp`, which converts multivariate polynomial programs to a clustered low-rank SDP and calls the solver. 
 - `prepareabc`, which does the conversion for a single constraint.
 - functions to create sample points and bases
+Using multiple threads is supported. For small problems, this might not give a speed up due to the overhead. To use multiple cores, start Julia with  `julia -t [number of threads]`.
 
 # Dependencies
 - `Arblib`, for arbitrary precision arithmetic
