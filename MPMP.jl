@@ -1,14 +1,15 @@
 module MPMP
 
-using AbstractAlgebra, Combinatorics
-using GenericLinearAlgebra, LinearAlgebra
+using AbstractAlgebra, Combinatorics #AbstractAlgebra is not really needed right?
+using GenericLinearAlgebra, LinearAlgebra #need GenericLinearAlgebra for BigFloat support (eigmin)
+
 using BlockDiagonals
 using Printf
 using GenericSVD #SVD of bigfloat matrix, for prepareabc with rank>1 structure
-using Arblib #lightweight implementation of Arb, in development
+using Arblib #lightweight implementation of Arb, in development. We are using it for matrix multiplication, and possibly for cholesky if that works
 
-#need GenericLinearAlgebra for BigFloat support (eigmin)
-import LinearAlgebra.dot
+#for extending to Arblib and BlockDiagonal
+import LinearAlgebra.dot, LinearAlgebra.cholesky
 import Base.abs, Base.max
 
 const T = BigFloat
@@ -189,12 +190,17 @@ function create_sample_points_chebyshev_mod(d,a=-1,b=1)
 end
 
 ## Functions for the solver
+#cholesky with Arblib:
+# include("Arblib_functions.jl")
+
 
 #extending LinearAlgebra.dot for our BlockDiagonal matrices. in principle 'type piracy'
-function dot(A::BlockDiagonal, B::BlockDiagonal)
+function LinearAlgebra.dot(A::BlockDiagonal, B::BlockDiagonal)
    #assume that A and B have the same blockstructure
    sum(dot(a,b) for (a,b) in zip(blocks(A), blocks(B)))
 end
+
+#extending max and abs to easily use max(abs(B)) for a blockdiagonal efficiently
 function max(A::AbstractMatrix)
     return max(A...)
 end
@@ -216,8 +222,7 @@ function prepareabc(M, # Vector of matrix polynomials
                     q, # Vector of polynomials
                     x, # Vector of points
                     δ = -1,# maximum degree. negative numbers-> use 2* the total degree of q[end]
-                    Pi = nothing;  #polynomial matrices, as much as G has. We will use A_(jrsk) = sum_l Tr(Q ⊗ E_rs) where Q = ∑_η λ_η(x_k)(√G[l](x_k)q(x_k) ⊗ v_η(x_k)) (√G[l](x_k)q(x_k) ⊗ v_η(x_k))^T
-                    normalize = false) # normalize constraint such that the highest
+                    Pi = nothing)  #polynomial matrices, as much as G has. We will use A_(jrsk) = sum_l Tr(Q ⊗ E_rs) where Q = ∑_η λ_η(x_k)(√G[l](x_k)q(x_k) ⊗ v_η(x_k)) (√G[l](x_k)q(x_k) ⊗ v_η(x_k))^T
                     #So λ_η sign(G[l](x_k)) is stored in A_sign[l,k][η] = H_(l,k,η), and the vectors (√G[l](x_k)q(x_k) ⊗ v_η(x_k)) in A[l,k][η]
     # Assumptions:
     # 1) all elements of M are the same size (true for a constraint)
@@ -261,35 +266,17 @@ function prepareabc(M, # Vector of matrix polynomials
     # println(degrees)
     # We can even put the whole G[l](x[k]...) in the 'sign'. We already have the eigenvalues of the Pi there
     # either way, better to be consistent (either also G in A_sign, or only the signs -> ev of Pi in A)
-    A_sign = [[T(Pi_vals[l,k][r]*sign(G[l](x[k]...))) for r=1:length(Pi_vals[l,k])] for l=1:length(G),k=1:length(x)]
-    A = [ [T.(kron([q[d](x[k]...)*sqrt(abs(G[l](x[k]...))) for d=1:degrees[div(δ-total_degree(G[l])-deg_Pi[l],2)+1]],Pi_vecs[l,k][r])) for r=1:length(Pi_vecs[l,k])] for l=1:length(G), k=1:length(x)]
+    A_sign = [[Arb(Pi_vals[l,k][r]*sign(G[l](x[k]...)),prec=precision(BigFloat)) for r=1:length(Pi_vals[l,k])] for l=1:length(G),k=1:length(x)]
+    A = [ [ArbMatrix(kron([q[d](x[k]...)*sqrt(abs(G[l](x[k]...))) for d=1:degrees[div(δ-total_degree(G[l])-deg_Pi[l],2)+1]],Pi_vecs[l,k][r]),prec=precision(BigFloat)) for r=1:length(Pi_vecs[l,k])] for l=1:length(G), k=1:length(x)]
     # A[l,k][r] is the vector v_{j,l,k,r} for this constraint j
     # A_sign[l,k][r] gives the sign and the r'th eigenvalue of Pi. i.e Q = \sum_r A_sign[l,k][r] A[l,k][r] *A[l,k][r]'
 
-    B = vcat([transpose([T(-M[i][r,s](x[k]...)) for i=2:length(M)]) for r=1:m for s=1:r for k=1:length(x)]...)
+    B = ArbMatrix(vcat([transpose([T(-M[i][r,s](x[k]...)) for i=2:length(M)]) for r=1:m for s=1:r for k=1:length(x)]...))
 
-    c = vcat([[T(M[1][r,s](x[k]...))] for r=1:m for s=1:r for k=1:length(x)]...)
-    if normalize
-        for k=1:length(x)
-            max_abs = BigFloat(0)
-            for l=1:length(G)
-                for r=1:length(Pi_vals[l,k])
-                    max_vec = max(abs.(A_sign[l,k][r]*(A[l,k][r]*A[l,k][r]'))...)
-                    max_abs = max(max_abs,max_vec)
-                end
-            end
-            max_abs = max(max_abs,abs.(B[k:div(m*(m+1),2):end,:])...,abs.(c[k:div(m*(m+1),2):end])...)*100.0
-
-            for l=1:length(G)
-                for r=1:length(Pi_vals[l,k])
-                    A_sign[l,k][r] /= max_abs
-                    A[l,k][r] ./= max_abs
-                end
-            end
-            B[k:div(m*(m+1),2):end,:] ./= max_abs
-            c[k:div(m*(m+1),2):end] ./= max_abs
-        end
-    end
+    c = ArbMatrix(vcat([[T(M[1][r,s](x[k]...))] for r=1:m for s=1:r for k=1:length(x)]...))
+    @assert precision(B) == precision(BigFloat)
+    @assert precision(c) == precision(BigFloat)
+    # println(size(B))
     return A, B, c, A_sign
 end
 
@@ -321,7 +308,6 @@ function get_block_info(constraints)
     # B has size #tuples * N
     n_y = size(constraints[1][2],2)
 
-
     #A is indexed by [l,k][r]:
     L = [size(constraints[j][1],1) for j=1:J]
     n_samples = [size(constraints[j][1],2) for j=1:J]
@@ -342,11 +328,11 @@ function get_block_info(constraints)
 end
 
 function solvempmp(M,G,q,x,delta, #same input as prepareabc
-                   b,Pi=nothing;normalize_prep = false, kwargs...) # Objective vector
+                   b,Pi=nothing; kwargs...) # Objective vector
     if !isnothing(Pi)
-        abc = [prepareabc(M[j],G[j],q[j],x[j],delta[j],Pi[j],normalize = normalize_prep) for j=1:length(M)]
+        abc = [prepareabc(M[j],G[j],q[j],x[j],delta[j],Pi[j]) for j=1:length(M)]
     else
-        abc = [prepareabc(M[j],G[j],q[j],x[j],delta[j],normalize = normalize_prep) for j=1:length(M)]
+        abc = [prepareabc(M[j],G[j],q[j],x[j],delta[j]) for j=1:length(M)]
     end
     # Use prepareabc to call solverank1sdp.
     blockinfo = get_block_info(abc)
@@ -357,11 +343,10 @@ end
 struct AbsoluteZero end
 LinearAlgebra.dot(x::AbsoluteZero,y) = eltype(y)(0)
 Base.:+(X::BlockDiagonal, C::AbsoluteZero) = X
-
-
+LinearAlgebra.dot(x::ArbMatrix,y::ArbMatrix) = Arblib.approx_dot!(Arb(0,prec=precision(x)),Arb(0,prec=precision(x)),0,x[:],1,y[:],1,length(x))
 
 """Solve the SDP with rank one constraint matrices."""
-function solverank1sdp(constraints, # list of (A,B,c,H) tuples (eltype = T)
+function solverank1sdp(constraints, # list of (A,B,c,H) tuples (ArbMatrices)
                        b, # Objective vector
                        blockinfo; # information about the block sizes etc.
                        C=0, b0 = 0, maxiterations=500,
@@ -370,15 +355,17 @@ function solverank1sdp(constraints, # list of (A,B,c,H) tuples (eltype = T)
                        gamma =  T(7)/10,
                        omega_p = T(10)^(10), #in general, can be chosen smaller. might need to be increased in some cases
                        omega_d = T(10)^(10),
-                       duality_gap_threshold = T(10)^(-30),
-                       primal_error_threshold = T(10)^(-30),
-                       dual_error_threshold = T(10)^(-30),
+                       duality_gap_threshold = T(10)^(-15),
+                       primal_error_threshold = T(10)^(-15),
+                       dual_error_threshold = T(10)^(-15),
                        need_primal_feasible = false,
                        need_dual_feasible = false,
                        testing = false)
                        #the defaultvalues mostly from Simmons-Duffin original paper
-    #convert to BigFloats:
-    b = T.(b)
+    #convert to Arbs:
+    b = ArbMatrix(b,prec=precision(BigFloat))
+    omega_p,omega_d,gamma,beta_feas,beta_infeas,b0,duality_gap_threshold,primal_error_threshold,dual_error_threshold = (
+    Arb.([omega_p,omega_d,gamma,beta_feas,beta_infeas,b0,duality_gap_threshold,primal_error_threshold,dual_error_threshold],prec=precision(BigFloat)))
     #initialize:
     #1): choose initial point q = (0, Ω_p*I, 0, Ω_d*I) = (x,X,y,Y), with Ω>0
     #main loop:
@@ -396,48 +383,65 @@ function solverank1sdp(constraints, # list of (A,B,c,H) tuples (eltype = T)
     #Repeat from step 2
 
     #step 1: initialize.
-    x = zeros(T,sum(blockinfo.dim_S)) # all tuples (j,r,s,k), equals size of S.
-    X = T(omega_p)*BlockDiagonal([BlockDiagonal([Matrix{T}(I,blockinfo.Y_blocksizes[j][l],blockinfo.Y_blocksizes[j][l]) for l=1:blockinfo.L[j]]) for j=1:blockinfo.J])
-    y = zeros(T,blockinfo.n_y)
-    Y = T(omega_d)*BlockDiagonal([BlockDiagonal([Matrix{T}(I,blockinfo.Y_blocksizes[j][l],blockinfo.Y_blocksizes[j][l]) for l=1:blockinfo.L[j]]) for j=1:blockinfo.J])
+    x = ArbMatrix(sum(blockinfo.dim_S),1,prec=precision(BigFloat)) # all tuples (j,r,s,k), equals size of S.
+    X = BlockDiagonal([BlockDiagonal([ArbMatrix(Matrix{T}(T(omega_p)*I,blockinfo.Y_blocksizes[j][l],blockinfo.Y_blocksizes[j][l]),prec=precision(BigFloat)) for l=1:blockinfo.L[j]]) for j=1:blockinfo.J])
+    y = ArbMatrix(blockinfo.n_y,1,prec=precision(BigFloat)) #first bigfloat then arbmatrix. Not that clean but okay
+    Y = BlockDiagonal([BlockDiagonal([ArbMatrix(Matrix{T}(T(omega_d)*I,blockinfo.Y_blocksizes[j][l],blockinfo.Y_blocksizes[j][l]),prec=precision(BigFloat)) for l=1:blockinfo.L[j]]) for j=1:blockinfo.J])
     if C == 0 #no C objective given. #in principle we can remove C in most cases. Only for computing residuals; not sure on the impact regarding memory (as it is always zero)
         # C = zero(Y) #make sure adding/subtracting C works in case it is 0.
         C = AbsoluteZero() # works
-        #Can we make it a 'special' zero which does nothing and requires no memory? So define X + C = X for all X, and dot(C,Y) = 0 for all Y
     end
-
 
     #step 2
     time_res = @elapsed begin
         P,p,d = compute_residuals(constraints,x,X,y,Y,b,C,blockinfo)
-        pd_feas = check_pd_feasibility(P,p,d,primal_error_threshold,dual_error_threshold)
     end
-
     #loop initialization
     iter = 1
     @printf("%5s %8s %11s %11s %11s %10s %10s %10s %10s %10s %10s %10s\n", "iter","time(s)","μ", "P-obj","D-obj","gap","P-error","p-error","d-error","α_p","α_d","beta")
-    alpha_p = alpha_d = T(0)
-    mu = dot(X,Y)/size(X,1) #block_diag_dot
+    alpha_p = alpha_d = Arb(0,prec=precision(BigFloat))
+    mu = dot(X,Y)/size(X,1) #block_diag_dot; NOTE: dot is not done in Arb; they dont have a dot product for matrices
     p_obj = compute_primal_objective(constraints,x,b0)
     d_obj = compute_dual_objective(y,Y,b,C,b0)
     dual_gap = compute_duality_gap(constraints,x,y,Y,C,b)
+    primal_error = compute_primal_error(P,p)
+    dual_error = compute_dual_error(d)
+    pd_feas = check_pd_feasibility(primal_error,dual_error,primal_error_threshold,dual_error_threshold)
+    spd_inv = true
+
     timings = zeros(Float64,17) #timings do not require high precision
     time_start = time()
-
-    while (!terminate(constraints,P,p,d,x,y,Y,C,b,duality_gap_threshold,primal_error_threshold,dual_error_threshold,need_primal_feasible,need_dual_feasible)
+    while (!terminate(dual_gap,primal_error,dual_error,duality_gap_threshold,primal_error_threshold,dual_error_threshold,need_primal_feasible,need_dual_feasible)
         && iter < maxiterations)
         #step 3
-        mu = dot(X,Y)/size(X,1) # block_diag_dot
-        mu_p =  pd_feas ? zero(mu) : beta_infeas * mu
+        mu = dot(X,Y)/size(X,1) # block_diag_dot,
+        mu_p =  pd_feas ? zero(mu) : beta_infeas * mu # zero(mu) keeps the precision
 
         #step 4
         time_R = @elapsed begin
             R = compute_residual_R(X,Y,mu_p)
         end
-
         time_inv = @elapsed begin
-            X_inv = BlockDiagonal([BlockDiagonal(inv.(cholesky.(blocks(bx)))) for bx in blocks(X)])
+            X_inv = similar(X)
+            Threads.@threads for j=1:blockinfo.J
+                for l=1:blockinfo.L[j]
+                    #This was the source of the error. Best would be to use spd_inv! until the precision is insufficient, then go to approx_inv!
+                    #Q: how to determine when the precision is unsufficient? see if error is thrown in compute_T_decomp?
+                    # Maybe check what is returned? and then switch over completely?
+                    if spd_inv
+                        status = Arblib.spd_inv!(X_inv.blocks[j].blocks[l],X.blocks[j].blocks[l])
+                        Arblib.get_mid!(X_inv.blocks[j].blocks[l],X_inv.blocks[j].blocks[l]) #ignore the error intervals, not needed for approx_inv
+                        if status == 0 #spd_inv went wrong,we use approx_inv from now on, for every block
+                            Arblib.approx_inv!(X_inv.blocks[j].blocks[l],X.blocks[j].blocks[l])
+                            spd_inv = false
+                        end
+                    else
+                        Arblib.approx_inv!(X_inv.blocks[j].blocks[l],X.blocks[j].blocks[l])
+                    end
+                end
+            end
         end
+
         time_decomp = @elapsed begin
             decomposition, time_schur,time_cholS,time_CinvB, time_Q,time_cholQ = compute_T_decomposition(constraints,X_inv,Y,blockinfo)
         end
@@ -447,9 +451,9 @@ function solverank1sdp(constraints, # list of (A,B,c,H) tuples (eltype = T)
         end
 
         #step 5
-        r = dot(X+dX,Y+dY)/(mu*size(X,1)) # block_diag_dot
-        beta = r<1 ? r^2 : r
-        beta_c = pd_feas ? min(max(beta_feas,beta),T(1)) : max(beta_infeas, beta)
+        r = dot(X+dX,Y+dY)/(mu*size(X,1)) # block_diag_dot + generic dot; what about arblib dot?
+        beta = r<1 ? r^2 : r #is arb
+        beta_c = pd_feas ? min(max(beta_feas,beta),Arb(1,prec=precision(BigFloat))) : max(beta_infeas, beta)
         mu_c = beta_c*mu
 
         #step 6
@@ -460,6 +464,9 @@ function solverank1sdp(constraints, # list of (A,B,c,H) tuples (eltype = T)
         time_corrector_dir = @elapsed begin
             dx,dX,dy,dY,times_corrector_in = compute_search_direction(constraints,P,p,d,R,X_inv,Y,blockinfo,decomposition)
         end
+
+        # println(typeof(dX))
+        # println(typeof(dY))
 
         #step 7
         time_alpha = @elapsed begin
@@ -472,12 +479,22 @@ function solverank1sdp(constraints, # list of (A,B,c,H) tuples (eltype = T)
             alpha_d = alpha_p
         end
         #step 8
-        x += alpha_p*dx
-        X += alpha_p*dX
-        y += alpha_d*dy
-        Y += alpha_d*dY
-        # dx = dX = dy = dY = nothing #does this help in memory usage?
+        Arblib.addmul!(x,dx,alpha_p)
+        Arblib.addmul!(y,dy,alpha_d)
+        # println("update dX dY")
+        Threads.@threads for j=1:blockinfo.J
+            Arblib.addmul!.(X.blocks[j].blocks,dX.blocks[j].blocks,alpha_p)
+            Arblib.get_mid!.(X.blocks[j].blocks,X.blocks[j].blocks)
 
+            Arblib.addmul!.(Y.blocks[j].blocks,dY.blocks[j].blocks,alpha_d)
+            Arblib.get_mid!.(Y.blocks[j].blocks,Y.blocks[j].blocks)
+        end
+        # x += alpha_p*dx
+        # X += alpha_p*dX
+        # y += alpha_d*dy
+        # Y += alpha_d*dY
+
+        # dx = dX = dy = dY = nothing #does this help in memory usage?
         if iter > 2 # do not save times of first few iterations, they can include compile times
             timings[1] += time_decomp
             timings[2] += time_predictor_dir
@@ -499,19 +516,20 @@ function solverank1sdp(constraints, # list of (A,B,c,H) tuples (eltype = T)
         p_obj = compute_primal_objective(constraints,x,b0)
         d_obj = compute_dual_objective(y,Y,b,C,b0)
         dual_gap = compute_duality_gap(constraints,x,y,Y,C,b)
-
+        primal_error = compute_primal_error(P,p)
+        dual_error = compute_dual_error(d)
         #step 2, preparation for new loop iteration
         iter+=1
         time_res = @elapsed begin
-            P,p,d = compute_residuals(constraints, x,X,y,Y,b,C,blockinfo)
+            P,p,d= compute_residuals(constraints,x,X,y,Y,b,C,blockinfo)
         end
-        pd_feas = check_pd_feasibility(P,p,d,primal_error_threshold,dual_error_threshold)
+        pd_feas = check_pd_feasibility(primal_error,dual_error,primal_error_threshold,dual_error_threshold) #are we computing things two times? i.e. here and in terminate?
     end
-    time_total = time()-time_start
+    time_total = time()-time_start #this may include compile time
     @printf("%5s %8s %11s %11s %11s %10s %10s %10s %10s %10s %10s %10s\n", "iter","time(s)","μ", "P-obj","D-obj","gap","P-error","p-error","d-error","α_p","α_d","beta")
 
     #print the total time needed for every part of the algorithm
-    println("\nTime spent: ")
+    println("\nTime spent: (The total time may include compile time. The first few iterations are not included in the rest of the times)")
     @printf("%11s %11s %11s %11s %11s %11s %11s %11s\n","total","Decomp","predict_dir","correct_dir","alpha","Xinv","R","res")
     @printf("%11.5e %11.5e %11.5e %11.5e %11.5e %11.5e %11.5e %11.5e\n\n",time_total,timings[1:7]...)
     println("Time inside decomp:")
@@ -550,13 +568,8 @@ end
 
 function dot_c(constraints,x)
     #compute dot(x,c) where c is distributed over the constraints
-    x_idx=1
-    res = eltype(x)(0)
-    for j=1:length(constraints)
-        res+=dot(constraints[j][3],x[x_idx:x_idx+length(constraints[j][3])-1])
-        x_idx+=length(constraints[j][3])
-    end
-    return res
+    c = vcat([constraints[j][3] for j=1:length(constraints)]...)
+    return dot(c,x) #both ArbMatrices, so use the dot I defined
 end
 
 """Compute the dual residue d = c- Tr(A_* Y) - By for this constraint."""
@@ -572,13 +585,21 @@ function compute_residuals(constraints,x,X,y,Y,b,C,blockinfo)
     # P = ∑_i A_i x_i - X - C,
     P = -(X+C)
     add_weighted_A!(P,constraints,x,blockinfo)
+    # println("res P get mid")
+    Threads.@threads for j=1:blockinfo.J
+        Arblib.get_mid!.(P.blocks[j].blocks,P.blocks[j].blocks)
+    end
 
     # d = c- Tr(A_* Y) -By
-    d = vcat([calculate_res_d(constraints[j],y,Y.blocks[j],blockinfo,j) for j=1:blockinfo.J]...)
-
+    d = vcat([calculate_res_d(constraints[j],y,Y.blocks[j],blockinfo,j) for j=1:blockinfo.J]...) #vcat seems to work with Arbmatrices
+    Arblib.get_mid!(d,d)
     # p = b -B^T x, B is distributed over constraints
     p = b
-    p_added = [zero(p) for j=1:blockinfo.J] #for parallelization
+    p_added = [zero(p) for j=1:blockinfo.J] #zero also works with Arb
+    # println(typeof(p_added[1]))
+    # println(typeof(constraints[1][2][1,:]))
+    # println(typeof(constraints[1][2][1:1,:]))
+    # println("res p")
     Threads.@threads for j=1:blockinfo.J
         cur_x = 1
         j_idx = sum(blockinfo.dim_S[1:j-1])
@@ -586,22 +607,32 @@ function compute_residuals(constraints,x,X,y,Y,b,C,blockinfo)
             for s=1:r
                 for k=1:blockinfo.n_samples[j]
                     #add to p:
-                    p_added[j] -= x[cur_x+j_idx]*constraints[j][2][cur_x,:]
+                    # println(typeof(p_added[j]))
+                    # println(typeof(x[cur_x+j_idx]))
+                    # println(typeof(ArbMatrix(constraints[j][2][cur_x,:])))
+                    Arblib.addmul!(p_added[j],constraints[j][2][cur_x:cur_x,:],-x[cur_x+j_idx])
+                    # p_added[j] -= x[cur_x+j_idx]*ArbMatrix(constraints[j][2][cur_x,:])
                     cur_x+=1 #x index for all r,s,k for this j
                 end # of k
             end # of s
         end # of r
     end # end of j
     p +=sum(p_added)
+    Arblib.get_mid!(p,p)
 
     return P,p,d
 end
 
 """Determine whether the main loop should terminate or not"""
-function terminate(constraints,P,p,d,x,y,Y,C,b,duality_gap_threshold,primal_error_threshold,dual_error_threshold,need_primal_feasible,need_dual_feasible)
-    duality_gap_opt = compute_duality_gap(constraints,x,y,Y,C,b) < duality_gap_threshold
-    primal_feas = compute_primal_error(P,p) < primal_error_threshold
-    dual_feas = compute_dual_error(d) < dual_error_threshold
+function terminate(duality_gap,primal_error,dual_error,duality_gap_threshold,primal_error_threshold,dual_error_threshold,need_primal_feasible,need_dual_feasible)
+# function terminate(constraints,P,p,d,x,y,Y,C,b,duality_gap_threshold,primal_error_threshold,dual_error_threshold,need_primal_feasible,need_dual_feasible)
+    #we can do this more efficient primal dual error, gap
+    # duality_gap_opt = compute_duality_gap(constraints,x,y,Y,C,b) < duality_gap_threshold
+    # primal_feas = compute_primal_error(P,p) < primal_error_threshold
+    # dual_feas = compute_dual_error(d) < dual_error_threshold
+    duality_gap_opt = duality_gap < duality_gap_threshold
+    primal_feas = primal_error < primal_error_threshold
+    dual_feas = dual_error < dual_error_threshold
     if need_primal_feasible && primal_feas
         println("Primal feasible solution found")
         return true
@@ -618,9 +649,9 @@ function terminate(constraints,P,p,d,x,y,Y,C,b,duality_gap_threshold,primal_erro
 end
 
 """Check primal and dual feasibility"""
-function check_pd_feasibility(P,p,d,primal_error_threshold,dual_error_threshold)
-    primal_feas = compute_primal_error(P,p) < primal_error_threshold
-    dual_feas = compute_dual_error(d) < dual_error_threshold
+function check_pd_feasibility(primal_error,dual_error,primal_error_threshold,dual_error_threshold)
+    primal_feas = primal_error < primal_error_threshold
+    dual_feas = dual_error < dual_error_threshold
     return primal_feas && dual_feas
 end
 
@@ -628,83 +659,156 @@ end
 """Compute the residual R, with or without second order term """
 function compute_residual_R(X,Y,mu)
     # R = mu*I - XY
-    R = similar(Y)
-    Threads.@threads for j=1:length(X.blocks)
+    R = similar(Y) #
+    # println("R 1")
+    Threads.@threads for j=1:length(Y.blocks)
         R.blocks[j] = mu*I + BlockDiagonal(.-(X.blocks[j].blocks .* Y.blocks[j].blocks))
+        Arblib.get_mid!.(R.blocks[j].blocks,R.blocks[j].blocks)
     end
+
     return R
 end
 
 function compute_residual_R(X,Y,mu,dX,dY)
     # R = mu*I - XY -dXdY
     R = similar(Y)
-    Threads.@threads for j=1:length(X.blocks)
+    # println("R 2")
+    Threads.@threads for j=1:length(Y.blocks)
+        # we could use approx_mul! here, but that is a little more difficult. Would it matter?
         R.blocks[j] = mu*I + BlockDiagonal( .- X.blocks[j].blocks .* Y.blocks[j].blocks
                                             .- dX.blocks[j].blocks .* dY.blocks[j].blocks)
+        Arblib.get_mid!.(R.blocks[j].blocks,R.blocks[j].blocks)
     end
     return R
 end
 
 """Compute S, integrated with the precomputing of the bilinear pairings"""
 function compute_S_integrated(constraints,X_inv,Y,blockinfo)
-    S = [zeros(T, blockinfo.dim_S[j],blockinfo.dim_S[j] ) for j=1:blockinfo.J]
+    S = [ArbMatrix(blockinfo.dim_S[j],blockinfo.dim_S[j],prec=precision(BigFloat)) for j=1:blockinfo.J]
     #bilinear pairings are only used per j,l. So we can compute them per j,l, and then make S_j
-    for j=1:blockinfo.J
+    # println("S int")
+    Threads.@threads for j=1:blockinfo.J #or over the L? Not sure what is better
         for l=1:blockinfo.L[j]
             #compute the bilinear pairings:
             #NOTE: ranks,n_samples and m are constant per j,l. So we can in principle make a single big matrix with a little more complicated indexing
             #       Not sure if that helps with performance above this type of indexing (matrix in matrix in matrix)
-            bilinear_Y = [[zeros(T,blockinfo.m[j],blockinfo.m[j]) for k1=1:blockinfo.n_samples[j], k2=1:blockinfo.n_samples[j]] for rnk1=1:blockinfo.ranks[j][l],rnk2=1:blockinfo.ranks[j][l]]
-            bilinear_Xinv = [[zeros(T,blockinfo.m[j],blockinfo.m[j]) for k1=1:blockinfo.n_samples[j], k2=1:blockinfo.n_samples[j]] for rnk1=1:blockinfo.ranks[j][l],rnk2=1:blockinfo.ranks[j][l]]
-            Threads.@threads for k1=1:blockinfo.n_samples[j]
-                for rnk1 = 1:blockinfo.ranks[j][l]
-                    #we can do Xv already here, then use the relevant part of that after s,k2
-                    # in principle that wont matter for theoretical complexity.
-                    v1 = constraints[j][1][l,k1][rnk1]
-                    delta = length(v1)
-                    for r=1:blockinfo.m[j]
-                        for s = 1:r
-                            Xv = X_inv.blocks[j].blocks[l][(r-1)*delta+1:r*delta,(s-1)*delta+1:s*delta] * v1
-                            Yv = Y.blocks[j].blocks[l][(r-1)*delta+1:r*delta,(s-1)*delta+1:s*delta] * v1
-                            if s!= r
-                                #only needed for off diagonal blocks (originally v1' * the same block. for dot(v1,block(r,s),v2) = dot(v2,block(s,r),v1))
-                                vX = X_inv.blocks[j].blocks[l][(s-1)*delta+1:s*delta,(r-1)*delta+1:r*delta]* v1
-                                vY = Y.blocks[j].blocks[l][(s-1)*delta+1:s*delta,(r-1)*delta+1:r*delta] * v1
-                            end
-                            for k2=1:k1 #do k1,k2 and k2,k1 at the same time
-                                for rnk2=1:blockinfo.ranks[j][l]
-                                    v2 = constraints[j][1][l,k2][rnk2]
-                                    bilinear_Xinv[rnk1,rnk2][k1,k2][s,r] = dot(v2,Xv) #equivalent to dot(v1,Xinv_block',v2)
-                                    if s!=r
-                                        bilinear_Xinv[rnk1,rnk2][k1,k2][r,s] = dot(vX,v2)
-                                    end
-                                    if k1!= k2
-                                        bilinear_Xinv[rnk2,rnk1][k2,k1][r,s] = bilinear_Xinv[rnk1,rnk2][k1,k2][s,r]
-                                        if s!= r
-                                            bilinear_Xinv[rnk2,rnk1][k2,k1][s,r] = bilinear_Xinv[rnk1,rnk2][k1,k2][r,s]
-                                        end
-                                    end
-                                    bilinear_Y[rnk1,rnk2][k1,k2][s,r] = dot(v2,Yv)
-                                    if s!=r
-                                        bilinear_Y[rnk1,rnk2][k1,k2][r,s] = dot(vY,v2)
-                                    end
-                                    if k1!= k2
-                                        bilinear_Y[rnk2,rnk1][k2,k1][r,s] = bilinear_Y[rnk1,rnk2][k1,k2][s,r]
-                                        if s!= r
-                                            bilinear_Y[rnk2,rnk1][k2,k1][s,r] = bilinear_Y[rnk1,rnk2][k1,k2][r,s]
-                                        end
-                                    end
-                                end
-                            end
-                        end
-                    end
+            # bilinear_Y = [[zeros(T,blockinfo.m[j],blockinfo.m[j]) for k1=1:blockinfo.n_samples[j], k2=1:blockinfo.n_samples[j]] for rnk1=1:blockinfo.ranks[j][l],rnk2=1:blockinfo.ranks[j][l]]
+            # bilinear_Xinv = [[zeros(T,blockinfo.m[j],blockinfo.m[j]) for k1=1:blockinfo.n_samples[j], k2=1:blockinfo.n_samples[j]] for rnk1=1:blockinfo.ranks[j][l],rnk2=1:blockinfo.ranks[j][l]]
+            #initialize (doesnt cost a lot of time)
+            vectors = hcat([constraints[j][1][l,k][rnk] for k=1:blockinfo.n_samples[j] for rnk=1:blockinfo.ranks[j][l]]...)
+            delta = length(constraints[j][1][l,1][1])# all vectors in this block have this length
+            vectors_trans = ArbMatrix(blockinfo.n_samples[j]*blockinfo.ranks[j][l],delta,prec = precision(BigFloat))
+            Arblib.transpose!(vectors_trans,vectors)
+            delta= length(constraints[j][1][l,1][1])# all vectors in this block have this length
+
+
+            #might be able to parallelize making the matrix: first zeros/undef
+            bilinear_pairings_Xinv = ArbMatrix(blockinfo.m[j]*blockinfo.n_samples[j]*blockinfo.ranks[j][l],blockinfo.m[j]*blockinfo.n_samples[j]*blockinfo.ranks[j][l],prec = precision(BigFloat))
+            bilinear_pairings_Y = ArbMatrix(blockinfo.m[j]*blockinfo.n_samples[j]*blockinfo.ranks[j][l],blockinfo.m[j]*blockinfo.n_samples[j]*blockinfo.ranks[j][l],prec = precision(BigFloat))
+
+            #no Arblib tensor/kronecker product, so we just do it per r,s block
+            for s=1:blockinfo.m[j]
+                part_matrix_Xinv = ArbMatrix(blockinfo.m[j]*delta,size(vectors,2),prec = precision(BigFloat))
+                part_matrix_Y = ArbMatrix(blockinfo.m[j]*delta,size(vectors,2),prec=precision(BigFloat))
+                Arblib.approx_mul!(part_matrix_Xinv,X_inv.blocks[j].blocks[l][:,(s-1)*delta+1:s*delta],vectors)
+                Arblib.approx_mul!(part_matrix_Y,Y.blocks[j].blocks[l][:,(s-1)*delta+1:s*delta],vectors)
+
+                # part_matrix_Xinv = X_inv.blocks[j].blocks[l][:,(s-1)*delta+1:s*delta] * vectors
+                # part_matrix_Y = Y.blocks[j].blocks[l][:,(s-1)*delta+1:s*delta] * vectors
+
+                for r=1:blockinfo.m[j] # we actually can do r=1:s, and then symmetrize?
+                    Xinv_part = ArbMatrix(blockinfo.n_samples[j]*blockinfo.ranks[j][l],blockinfo.n_samples[j]*blockinfo.ranks[j][l],prec=precision(BigFloat))
+                    Arblib.approx_mul!(Xinv_part,vectors_trans,part_matrix_Xinv[(r-1)*delta+1:r*delta,:])
+                    bilinear_pairings_Xinv[(r-1)*blockinfo.n_samples[j]*blockinfo.ranks[j][l]+1:r*blockinfo.n_samples[j]*blockinfo.ranks[j][l],(s-1)*blockinfo.n_samples[j]*blockinfo.ranks[j][l]+1:s*blockinfo.n_samples[j]*blockinfo.ranks[j][l]] = Xinv_part
+
+                    Y_part = ArbMatrix(blockinfo.n_samples[j]*blockinfo.ranks[j][l],blockinfo.n_samples[j]*blockinfo.ranks[j][l],prec=precision(BigFloat))
+                    Arblib.approx_mul!(Y_part,vectors_trans,part_matrix_Y[(r-1)*delta+1:r*delta,:])
+                    bilinear_pairings_Y[(r-1)*blockinfo.n_samples[j]*blockinfo.ranks[j][l]+1:r*blockinfo.n_samples[j]*blockinfo.ranks[j][l],(s-1)*blockinfo.n_samples[j]*blockinfo.ranks[j][l]+1:s*blockinfo.n_samples[j]*blockinfo.ranks[j][l]] = Y_part
                 end
             end
+            #clear the memory; probably unnecessary
+            # Arblib.clear!(vectors_trans)
+            # Arblib.clear!(vectors)
+            # Arblib.clear!(part_matrix_Xinv)
+            # Arblib.clear!(part_matrix_Y)
+
+            # Threads.@threads for k1=1:blockinfo.n_samples[j]
+            #     for rnk1 = 1:blockinfo.ranks[j][l]
+            #         #we can do Xv already here, then use the relevant part of that after s,k2
+            #         # in principle that wont matter for theoretical complexity.
+            #         v1 = constraints[j][1][l,k1][rnk1]
+            #         delta = length(v1)
+            #         for r=1:blockinfo.m[j]
+            #             for s = 1:r
+            #                 Xv = X_inv.blocks[j].blocks[l][(r-1)*delta+1:r*delta,(s-1)*delta+1:s*delta] * v1
+            #                 Yv = Y.blocks[j].blocks[l][(r-1)*delta+1:r*delta,(s-1)*delta+1:s*delta] * v1
+            #                 if s!= r
+            #                     #only needed for off diagonal blocks (originally v1' * the same block. for dot(v1,block(r,s),v2) = dot(v2,block(s,r),v1))
+            #                     vX = X_inv.blocks[j].blocks[l][(s-1)*delta+1:s*delta,(r-1)*delta+1:r*delta]* v1
+            #                     vY = Y.blocks[j].blocks[l][(s-1)*delta+1:s*delta,(r-1)*delta+1:r*delta] * v1
+            #                 end
+            #                 for k2=1:k1 #do k1,k2 and k2,k1 at the same time
+            #                     for rnk2=1:blockinfo.ranks[j][l]
+            #                         v2 = constraints[j][1][l,k2][rnk2]
+            #                         bilinear_Xinv[rnk1,rnk2][k1,k2][s,r] = dot(v2,Xv) #equivalent to dot(v1,Xinv_block',v2)
+            #                         if s!=r
+            #                             bilinear_Xinv[rnk1,rnk2][k1,k2][r,s] = dot(vX,v2)
+            #                         end
+            #                         if k1!= k2
+            #                             bilinear_Xinv[rnk2,rnk1][k2,k1][r,s] = bilinear_Xinv[rnk1,rnk2][k1,k2][s,r]
+            #                             if s!= r
+            #                                 bilinear_Xinv[rnk2,rnk1][k2,k1][s,r] = bilinear_Xinv[rnk1,rnk2][k1,k2][r,s]
+            #                             end
+            #                         end
+            #                         bilinear_Y[rnk1,rnk2][k1,k2][s,r] = dot(v2,Yv)
+            #                         if s!=r
+            #                             bilinear_Y[rnk1,rnk2][k1,k2][r,s] = dot(vY,v2)
+            #                         end
+            #                         if k1!= k2
+            #                             bilinear_Y[rnk2,rnk1][k2,k1][r,s] = bilinear_Y[rnk1,rnk2][k1,k2][s,r]
+            #                             if s!= r
+            #                                 bilinear_Y[rnk2,rnk1][k2,k1][s,r] = bilinear_Y[rnk1,rnk2][k1,k2][r,s]
+            #                             end
+            #                         end
+            #                     end
+            #                 end
+            #             end
+            #         end
+            #     end
+            # end
 
             #compute the contribution of this l to S[j]
+            # for r1 = 1:blockinfo.m[j]
+            #     for s1=1:r1
+            #         Threads.@threads for k1=1:blockinfo.n_samples[j]
+            #             #index for the tuple (r1,s1,k1):
+            #             hor_el = k1+((s1-1)+div(r1*(r1-1),2))*blockinfo.n_samples[j]
+            #             for r2=1:blockinfo.m[j]
+            #                 for s2=1:r2
+            #                     for k2 = 1:blockinfo.n_samples[j]
+            #                         #index for the tuple (r2,s2,k2):
+            #                         ver_el = k2+((s2-1)+div(r2*(r2-1),2))*blockinfo.n_samples[j]
+            #                         if ver_el <= hor_el #upper triangular part
+            #                             for rnk1=1:blockinfo.ranks[j][l],rnk2=1:blockinfo.ranks[j][l] #in one thread, we modify an element multiple times
+            #                                 # sgn = constraints[j][4][l,k1][rnk1] * constraints[j][4][l,k2][rnk2]
+            #                                 #indexing is[rnk1,rnk2][k1,k2][r,s]. rnk1 corresponds to k1, rnk2 to k2
+            #                                 S[j][ver_el,hor_el] += constraints[j][4][l,k1][rnk1] * constraints[j][4][l,k2][rnk2]/T(4)*(
+            #                                     bilinear_Xinv[rnk1,rnk2][k1,k2][s1,r2] * bilinear_Y[rnk2,rnk1][k2,k1][s2,r1]
+            #                                     + bilinear_Xinv[rnk1,rnk2][k1,k2][r1,r2] * bilinear_Y[rnk2,rnk1][k2,k1][s2,s1]
+            #                                     + bilinear_Xinv[rnk1,rnk2][k1,k2][s1,s2] * bilinear_Y[rnk2,rnk1][k2,k1][r2,r1]
+            #                                     + bilinear_Xinv[rnk1,rnk2][k1,k2][r1,s2] * bilinear_Y[rnk2,rnk1][k2,k1][r2,s1] )
+            #                             end
+            #                         end
+            #                     end
+            #                 end
+            #             end
+            #         end
+            #     end
+            # end
+            #compute the contribution of this l to S[j]. Threads per j, so different threads dont write/read to/from the same matrices
             for r1 = 1:blockinfo.m[j]
                 for s1=1:r1
-                    Threads.@threads for k1=1:blockinfo.n_samples[j]
+                    for k1=1:blockinfo.n_samples[j]
                         #index for the tuple (r1,s1,k1):
                         hor_el = k1+((s1-1)+div(r1*(r1-1),2))*blockinfo.n_samples[j]
                         for r2=1:blockinfo.m[j]
@@ -714,13 +818,16 @@ function compute_S_integrated(constraints,X_inv,Y,blockinfo)
                                     ver_el = k2+((s2-1)+div(r2*(r2-1),2))*blockinfo.n_samples[j]
                                     if ver_el <= hor_el #upper triangular part
                                         for rnk1=1:blockinfo.ranks[j][l],rnk2=1:blockinfo.ranks[j][l] #in one thread, we modify an element multiple times
-                                            # sgn = constraints[j][4][l,k1][rnk1] * constraints[j][4][l,k2][rnk2]
-                                            #indexing is[rnk1,rnk2][k1,k2][r,s]. rnk1 corresponds to k1, rnk2 to k2
-                                            S[j][ver_el,hor_el] += constraints[j][4][l,k1][rnk1] * constraints[j][4][l,k2][rnk2]/T(4)*(
-                                                bilinear_Xinv[rnk1,rnk2][k1,k2][s1,r2] * bilinear_Y[rnk2,rnk1][k2,k1][s2,r1]
-                                                + bilinear_Xinv[rnk1,rnk2][k1,k2][r1,r2] * bilinear_Y[rnk2,rnk1][k2,k1][s2,s1]
-                                                + bilinear_Xinv[rnk1,rnk2][k1,k2][s1,s2] * bilinear_Y[rnk2,rnk1][k2,k1][r2,r1]
-                                                + bilinear_Xinv[rnk1,rnk2][k1,k2][r1,s2] * bilinear_Y[rnk2,rnk1][k2,k1][r2,s1] )
+                                            #calculate the entries of the bilinear pairing matrices corresponding to r1,s1,r2 and s2
+                                            r1_spot = rnk1+blockinfo.ranks[j][l]*((k1-1)+ blockinfo.n_samples[j] *(r1-1))
+                                            r2_spot = rnk2+blockinfo.ranks[j][l]*((k2-1)+ blockinfo.n_samples[j] *(r2-1))
+                                            s1_spot = rnk1+blockinfo.ranks[j][l]*((k1-1)+ blockinfo.n_samples[j] *(s1-1))
+                                            s2_spot = rnk2+blockinfo.ranks[j][l]*((k2-1)+ blockinfo.n_samples[j] *(s2-1))
+                                            S[j][ver_el,hor_el] += constraints[j][4][l,k1][rnk1] * constraints[j][4][l,k2][rnk2]/Arb(4,prec=precision(BigFloat))*(
+                                                bilinear_pairings_Xinv[s1_spot,r2_spot] * bilinear_pairings_Y[s2_spot,r1_spot]
+                                                + bilinear_pairings_Xinv[r1_spot,r2_spot] * bilinear_pairings_Y[s2_spot,s1_spot]
+                                                + bilinear_pairings_Xinv[s1_spot,s2_spot] * bilinear_pairings_Y[r2_spot,r1_spot]
+                                                + bilinear_pairings_Xinv[r1_spot,s2_spot] * bilinear_pairings_Y[r2_spot,s1_spot] )
                                         end
                                     end
                                 end
@@ -729,11 +836,14 @@ function compute_S_integrated(constraints,X_inv,Y,blockinfo)
                     end
                 end
             end
-            bilinear_Y = nothing
-            bilinear_Xinv = nothing
+            # Arblib.clear!(bilinear_pairings_Xinv)
+            # Arblib.clear!(bilinear_pairings_Y)
+
         end
+        S[j] .= Symmetric(S[j]) #symmetrize
+        Arblib.get_mid!(S[j],S[j])
     end
-    return Symmetric.(S) # the blocks S[j], symmetrized
+    return S
 end
 
 
@@ -747,52 +857,68 @@ function compute_T_decomposition(constraints,X_inv,Y,blockinfo)
     # 1,2) compute the bilinear pairings and S, integrated. (per j,l, compute first pairings then S[j] part)
     time_schur = @elapsed begin
         S = compute_S_integrated(constraints,X_inv,Y,blockinfo)
+        # println([precision(S[j]) for j=1:blockinfo.J])
     end
 
+    # println("S,C")
     #3) cholesky decomposition of S
     time_cholS = @elapsed begin
-        C1 = cholesky(S[1])
-        C = [C1 for j=1:blockinfo.J] #initialize.
-        Threads.@threads for j=2:blockinfo.J
-            C[j] = cholesky(S[j])
+        C = [similar(S[j]) for j=1:blockinfo.J]
+        # println("S chol")
+        Threads.@threads for j=1:blockinfo.J
+            # Arblib.get_mid!(S[j],S[j])
+            # we need cholesky, cannot use LU because we need CinvB.
+            C[j] = ArbMatrix(cholesky(T.(S[j])).L.data) #do this cholesky with BigFloats
+            # println(Arb(max(Arblib.radref.(S[j])...)))
+            # println(Arb(max(Arblib.radref.(C[j])...)))
+            # Arblib.get_mid!(C[j],C[j]) #ignore errors obtained from cholesky. Errors can get very large...
         end
     end
 
     #4) compute decomposition
     # CinvB has blocks C[j].L^-1 * B[j]
     time_CinvB = @elapsed begin
-        CinvB = [zeros(T,blockinfo.dim_S[j],blockinfo.n_y) for j=1:blockinfo.J]
+        CinvB = [ArbMatrix(blockinfo.dim_S[j],blockinfo.n_y,prec = precision(BigFloat)) for j=1:blockinfo.J]
+        # println("CinvB")
         Threads.@threads for j=1:blockinfo.J
-            CinvB[j] = C[j].L \ constraints[j][2]
+            Arblib.approx_solve_tril!(CinvB[j],C[j],constraints[j][2],0) #this threaded gives an error?
         end
     end
-
+    # println("Q,Q_chol")
     #compute Q = B^T C.L^{-T} C.L^{-1}B
     #takes the most time (for multivariate).  May have advantage of reordering the constraints -> large constraints on separate threads.
     time_Q = @elapsed begin
-        Q = [ArbMatrix(zeros(T,blockinfo.n_y,blockinfo.n_y),prec = precision(BigFloat)) for j=1:blockinfo.J]
+        Q = [ArbMatrix(blockinfo.n_y,blockinfo.n_y,prec = precision(BigFloat)) for j=1:blockinfo.J]
+        # println("comp Q")
         Threads.@threads for j=1:blockinfo.J
             #Note, if CinvB is ArbMatrix already, we still need to take ArbMatrix(transpose(CinvB[j])); matrix multiplication is not implemented for the adjoint in Arblib yet
-            Q[j] = ArbMatrix(transpose(CinvB[j]),prec=precision(BigFloat)) * ArbMatrix(CinvB[j],prec=precision(BigFloat))
+            transp = ArbMatrix(size(CinvB[j],2),size(CinvB[j],1),prec = precision(BigFloat)) #may be the fix to lesser precision?
+            Arblib.approx_mul!(Q[j],Arblib.transpose!(transp,CinvB[j]),CinvB[j])
         end
-        #go back to bigfloats for cholesky etc
-        Q = BigFloat.(sum(Q))
+        Q = sum(Q)
+        # Arblib.get_mid!(Q,Q)
     end
 
     # compute the cholesky factors of Q
     time_cholQ = @elapsed begin
-        Q_chol = cholesky(Q)
+        Q_chol = similar(Q)
+        perm = [0 for i=1:size(Q,1)]
+        Arblib.approx_lu!(perm,Q_chol,Q,prec = precision(Q))
+        #Do approximate lu instead of cholesky. About as fast due to no error bounds, and more stable
+        # Arblib.get_mid!(Q_chol,Q_chol) #ignore error bounds from cholesky
     end
 
     # C, CinvB, Q are the blocks that are used to build the decomposition.
-    return (C,CinvB,Q_chol), time_schur,time_cholS,time_CinvB,time_Q,time_cholQ
+    return (C,CinvB,perm,Q_chol), time_schur,time_cholS,time_CinvB,time_Q,time_cholQ
 end
 
 """Compute the vector Tr(A_* Z) for one or all constraints"""
 function trace_A(constraints,Z,blockinfo)
     #Assumption: Z is symmetric
-    result = zeros(T,sum(blockinfo.dim_S)) #one entry for each (j,r,s,k) tuple
-    Threads.@threads for j in eachindex(constraints)
+    result = ArbMatrix(sum(blockinfo.dim_S),1,prec=precision(BigFloat)) #precision is precision of T i.e. precision(BigFloat)
+    #one entry for each (j,r,s,k) tuple
+    # println("trace A gen")
+    Threads.@threads for j=1:blockinfo.J
         j_idx = sum(blockinfo.dim_S[1:j-1])
         tup_idx = 1
         for r = 1:blockinfo.m[j]
@@ -800,14 +926,21 @@ function trace_A(constraints,Z,blockinfo)
                 for k=1:blockinfo.n_samples[j]
                     for l=1:blockinfo.L[j]
                         for rnk=1:blockinfo.ranks[j][l]
-                            v = constraints[j][1][l,k][rnk]
-                            sgn = constraints[j][4][l,k][rnk]
+                            v = constraints[j][1][l,k][rnk] #we might want to store constraints things as arbmatrices...
                             delta = length(v)
+                            v_transpose = ArbMatrix(1,delta,prec=precision(BigFloat))
+                            Arblib.transpose!(v_transpose,v)
+                            sgn = constraints[j][4][l,k][rnk]
                             # assumption:Z is symmetric. In that case Tr(vv^T Z[rs]) = Tr(vv^T Z[sr])
-                            result[j_idx+tup_idx] += sgn*dot(v,Z.blocks[j].blocks[l][(s-1)*delta+1:s*delta,(r-1)*delta+1:r*delta],v)
+                            # Can we do this with larger matrix multiplications? Like the bilinear pairings?
+                            # we can make a matrix V of k,rnk, and then do V^T Z^{j,l}_{r,s} V.
+                            # But we need less, because we only need the diagonal of that.
+                            # so we can do Z^{j,l}_{r,s} V and then take v^T * [column of Z corresponding to v]
+                            # So basically precompute Z V per j,l,r,s and then add the things to the right element with a loop over k,rnk
+                            result[j_idx+tup_idx,1] += sgn*(v_transpose*Z.blocks[j].blocks[l][(s-1)*delta+1:s*delta,(r-1)*delta+1:r*delta]*v)[1,1]
                         end
                     end
-                    tup_idx += 1
+                    tup_idx += 1 #tuple (r,s,k)
                 end
             end
         end
@@ -817,17 +950,19 @@ end
 
 function trace_A(constraint,Z,blockinfo,j)
     #Assumption: Z is symmetric
-    result = zeros(T,sum(blockinfo.dim_S[j]))
+    result = ArbMatrix(sum(blockinfo.dim_S[j]),1,prec = precision(BigFloat))
     tup_idx = 1
     for r = 1:blockinfo.m[j]
         for s=1:r
             for k=1:blockinfo.n_samples[j]
                 for l=1:blockinfo.L[j]
                     for rnk=1:blockinfo.ranks[j][l]
-                        v = constraint[1][l,k][rnk]
-                        sgn = constraint[4][l,k][rnk]
+                        v = constraint[1][l,k][rnk] #we might want to store constraints things as arbmatrices...
                         delta = length(v)
-                        result[tup_idx]+= sgn*dot(v,Z.blocks[l][(r-1)*delta+1:r*delta,(s-1)*delta+1:s*delta],v)
+                        v_transpose = ArbMatrix(1,delta,prec=precision(BigFloat))
+                        Arblib.transpose!(v_transpose,v)
+                        sgn = constraint[4][l,k][rnk]
+                        result[tup_idx,1]+= sgn*(v_transpose*Z.blocks[l][(r-1)*delta+1:r*delta,(s-1)*delta+1:s*delta]*v)[1,1]
                     end
                 end
                 tup_idx +=1
@@ -839,95 +974,158 @@ end
 
 """Add ∑_i a_i A_i to initial_matrix"""
 function add_weighted_A!(initial_matrix,constraints,a,blockinfo)
+    #initial matrix is block matrix of ArbMatrices
     #NOTE: instead of adding Q to both the r,s block and the s,r block, we can add it to the upper block and use Symmetric()
     # Saves some time, but not in place anymore (afaik)
+    # Threads.@threads
+    # println("add weighted A")
     Threads.@threads for j=1:blockinfo.J
         j_idx = sum(blockinfo.dim_S[1:j-1])
         cur_a = 1
         for l = 1:blockinfo.L[j]
+            delta = length(constraints[j][1][l,1][1])
             for r=1:blockinfo.m[j]
                 for s=1:r
-                    delta = length(constraints[j][1][l,1][1])
-                    Q = zeros(T,delta,delta)
+                    Q = ArbMatrix(delta,delta,prec= precision(BigFloat))
                     for k=1:blockinfo.n_samples[j]
                         cur_a = k+(s-1+div(r*(r-1),2))*blockinfo.n_samples[j]
                         for rnk=1:blockinfo.ranks[j][l]
                             v = constraints[j][1][l,k][rnk] #v_{j,l,k,i}
-                            sgn = constraints[j][4][l,k][rnk]
+                            sgn = constraints[j][4][l,k][rnk]*a[cur_a+j_idx]/Arb(2,prec=precision(BigFloat))
                             #the Q which should be added to the j,l,(r,s) and (s,r) block of P
                             #a[i]*v*v' is not always symmetric, a[i]*(v*v') is.
-                            Q += Symmetric(sgn/T(2)*a[cur_a+j_idx]*(v*v'))
+                            v_transpose = ArbMatrix(1,delta,prec=precision(BigFloat))
+                            Arblib.transpose!(v_transpose,v)
+                            Arblib.addmul!(Q,v*v_transpose,sgn)
+                            # Q += Symmetric(sgn/2*a[cur_a+j_idx]*(v*v_transpose)) #expect a[i] to be Arb
                         end
                         cur_a+=1 # tuple (r,s,k)
                     end
                     if r != s
                         # initial_matrix.blocks[j].blocks[l][(r-1)*delta+1:r*delta, (s-1)*delta+1:s*delta] += Q
-                        initial_matrix.blocks[j].blocks[l][(s-1)*delta+1:s*delta, (r-1)*delta+1:r*delta] += Q #Q = Q'
+                        #Arblib.addmul!(B,A,c) => B = B+ c*A
+                        initial_matrix.blocks[j].blocks[l][(s-1)*delta+1:s*delta, (r-1)*delta+1:r*delta] += Q #Q = Q'# works
                     else
-                        initial_matrix.blocks[j].blocks[l][(r-1)*delta+1:r*delta, (r-1)*delta+1:r*delta] += 2*Q #Q = Q'
+                        Arblib.mul!(Q,Q,2) #Q -> 2Q, which has to be added to this block
+                        initial_matrix.blocks[j].blocks[l][(r-1)*delta+1:r*delta, (r-1)*delta+1:r*delta] += Q #Q = Q' Maybe addmul is more efficient?
                     end
                 end
             end
+            #is there a symmetric function in arblib? havent seen it
             initial_matrix.blocks[j].blocks[l] .= Symmetric(initial_matrix.blocks[j].blocks[l])
         end
     end
+
     return nothing #initial matrix modified, nothing returned
 end
 
 """Compute the search directions, using a precomputed decomposition"""
-function compute_search_direction(constraints,P,p,d,R,X_inv,Y,blockinfo,(C,CinvB,Q))
+function compute_search_direction(constraints,P,p,d,R,X_inv,Y,blockinfo,(C,CinvB,perm,Q))
     # using the decomposition, compute the search directions
     # 5) solve system with rhs dx,dy <- (-d - Tr(A_* Z) ;  p) with Z = X^{-1}(PY - R)
+    #NOTE:  computing rhs_x (including Z) only needs to be done once; so we may want to do that before the function
     # 6) compute dX = P + sum_i A_i dx_i
     # 7) compute dY = X^{-1}(R-dX Y) (XdY = R-dXY)
     # 8) symmetrize dY = 1/2 (dY +dY')
     time_Z = @elapsed begin
         Z = similar(Y)
+        # println("Z")
         Threads.@threads for j=1:blockinfo.J
-            Z.blocks[j].blocks .= X_inv.blocks[j].blocks .* (P.blocks[j].blocks .* Y.blocks[j].blocks .- R.blocks[j].blocks)
-            Z.blocks[j].blocks .= 1 ./T(2) .*(Z.blocks[j].blocks .+ transpose.(Z.blocks[j].blocks)) #the fix. Only necessary when m[j]>1
+            #works, but maybe we need to use Arblib.approx_mul! ? (would probably be slightly faster)
+            # Z.blocks[j].blocks .= X_inv.blocks[j].blocks .* (P.blocks[j].blocks .* Y.blocks[j].blocks .- R.blocks[j].blocks)
+            #Z = X_inv*(P*Y-R)
+            for l=1:blockinfo.L[j]
+                # temp = similar(Z.blocks[j].blocks[l])
+                Arblib.approx_mul!(Z.blocks[j].blocks[l],P.blocks[j].blocks[l],Y.blocks[j].blocks[l])
+                Arblib.sub!(Z.blocks[j].blocks[l],Z.blocks[j].blocks[l],R.blocks[j].blocks[l])
+                Arblib.approx_mul!(Z.blocks[j].blocks[l],X_inv.blocks[j].blocks[l],Z.blocks[j].blocks[l])
+                temp_t = similar(Z.blocks[j].blocks[l])
+                Arblib.transpose!(temp_t,Z.blocks[j].blocks[l])
+                Arblib.mul!(Z.blocks[j].blocks[l],Z.blocks[j].blocks[l]+temp_t,Arb(1//2,prec=precision(BigFloat)))
+                Arblib.get_mid!(Z.blocks[j].blocks[l],Z.blocks[j].blocks[l])
+                # Z.blocks[j].blocks[l] = X_inv.blocks[j].blocks[l] * (P.blocks[j].blocks[l] * Y.blocks[j].blocks[l] - R.blocks[j].blocks[l])
+            end# println(Z.blocks[j].blocks[1][1,1])
+            # blocks_transpose = similar(Z.blocks[j]) #not sure things will work entrywise
+            # Arblib.transpose!.(blocks_transpose.blocks,Z.blocks[j].blocks)
+            # Arblib.mul!.(Z.blocks[j].blocks,Z.blocks[j].blocks .+ blocks_transpose.blocks, Arb(1//2))
+            # Arblib.get_mid!.(Z.blocks[j].blocks,Z.blocks[j].blocks) #
         end
     end
-
     rhs_y = p
     time_rhs_x = @elapsed begin
+        rhs_x = similar(d) #similar initializes ArbMatrices with zeros
         rhs_x = -d - trace_A(constraints,Z,blockinfo)
+        Arblib.get_mid!(rhs_x,rhs_x)
     end
 
     # solve the system (C 0; CinvB^T I)(I 0; 0 LL^T)(C^T -CinvB; 0 I)(dx; dy) = (rhs_x; rhs_y)
     indices = blockinfo.x_indices #0, dim_S[1], dim_S[1]+dim_S[2],... ,sum(dim_S)
+    #solve system is completely Arblib now
     time_sys = @elapsed begin
         #first lower triangular system:
-        temp_x = similar(rhs_x)
+        temp_x = [ArbMatrix(indices[j+1]-indices[j],1,prec=precision(BigFloat)) for j=1:blockinfo.J]
         temp_y = [similar(rhs_y) for j=1:blockinfo.J]
+        # println("solve sys")
         Threads.@threads for j=1:blockinfo.J
-            temp_x[indices[j]+1:indices[j+1]] = C[j].L \ rhs_x[indices[j]+1:indices[j+1]]
-            temp_y[j] = CinvB[j]' * temp_x[indices[j]+1:indices[j+1]]
+            Arblib.approx_solve_tril!(temp_x[j],C[j],rhs_x[indices[j]+1:indices[j+1],:],0)
+            transp = ArbMatrix(size(CinvB[j],2),size(CinvB[j],1),prec=precision(BigFloat))
+            Arblib.approx_mul!(temp_y[j], Arblib.transpose!(transp,CinvB[j]),temp_x[j]) #now its an ArbMatrix, otherwise ArbVector which uses generic multipilcations
         end
-        temp_y = rhs_y - sum(temp_y)
-
-        #second system: temp_x stays the same
-        dy  = Q \ temp_y
+        dy = similar(rhs_y)
+        Arblib.sub!(dy,rhs_y,sum(temp_y))
+        # dy = rhs_y - sum(temp_y)
+        #second system: temp_x stays the same, dy_new  =  Q^-1 dy_old
+        Arblib.approx_solve_lu_precomp!(dy,perm,Q,dy)
 
         #third system:
-        dx = similar(rhs_x)
+        dx = [ArbMatrix(indices[j+1]-indices[j],1,prec=precision(BigFloat)) for j=1:blockinfo.J]
+        # println("solve sys 2")
         Threads.@threads for j=1:blockinfo.J
-            dx[indices[j]+1:indices[j+1]] = C[j].U \ (temp_x[indices[j]+1:indices[j+1]] + CinvB[j] * dy)
+            temp_C = similar(C[j])
+            # Arblib.addmul!(temp_x[j],CinvB[j],dy)
+            Arblib.approx_solve_triu!(dx[j],Arblib.transpose!(temp_C,C[j]),(temp_x[j] + CinvB[j] * dy),0)
         end
+        #convert back
+        # println(dx[1])
+        # println(dy[1])
+        dx = vcat([dx[j] for j=1:blockinfo.J]...)
+        Arblib.get_mid!(dx,dx) #not sure if this is needed, because we used approx_solve_triu! (i.e. the approx version)
     end #of timing system
 
     #step 6:
     time_dX = @elapsed begin
-        dX = I*P # making sure dX does not reference to P anymore
-        add_weighted_A!(dX,constraints,dx,blockinfo)
+        dX = similar(P) # making sure dX does not reference to P anymore
+        dX += P
+        add_weighted_A!(dX,constraints, dx,blockinfo)
     end
+    # println(time_dX_copy/time_dX*100.0)
 
     #step 7 & 8
     time_dY = @elapsed begin
         dY = similar(Y)
+        # println("dY")
         Threads.@threads for j=1:blockinfo.J
-            dY.blocks[j].blocks .= X_inv.blocks[j].blocks .* (R.blocks[j].blocks .- dX.blocks[j].blocks .* Y.blocks[j].blocks)
-            dY.blocks[j].blocks .= 1 ./T(2) .*(dY.blocks[j].blocks .+ transpose.(dY.blocks[j].blocks)) #symmetrize
+            #dY = X_inv * (R- dX *Y)
+            for l=1:blockinfo.L[j]
+                # temp = similar(dY.blocks[j].blocks[l])
+                Arblib.approx_mul!(dY.blocks[j].blocks[l],dX.blocks[j].blocks[l],Y.blocks[j].blocks[l])
+                Arblib.sub!(dY.blocks[j].blocks[l],R.blocks[j].blocks[l],dY.blocks[j].blocks[l])
+                Arblib.approx_mul!(dY.blocks[j].blocks[l],X_inv.blocks[j].blocks[l],dY.blocks[j].blocks[l])
+                temp_t = similar(dY.blocks[j].blocks[l])
+                Arblib.transpose!(temp_t,dY.blocks[j].blocks[l])
+                Arblib.mul!(dY.blocks[j].blocks[l],dY.blocks[j].blocks[l]+temp_t,Arb(1//2,prec=precision(BigFloat)))
+                Arblib.get_mid!(dY.blocks[j].blocks[l],dY.blocks[j].blocks[l])
+                Arblib.get_mid!(dX.blocks[j].blocks[l],dX.blocks[j].blocks[l])
+            end
+            # dY.blocks[j].blocks .= X_inv.blocks[j].blocks .* (R.blocks[j].blocks .- dX.blocks[j].blocks .* Y.blocks[j].blocks)
+            # blocks_transpose = similar(dY.blocks[j]) #not sure things will work entrywise
+            # Arblib.transpose!.(blocks_transpose.blocks,dY.blocks[j].blocks)
+            # Arblib.mul!.(dY.blocks[j].blocks,dY.blocks[j].blocks .+ blocks_transpose.blocks, Arb(1//2))
+            # dY.blocks[j].blocks .= 1 ./T(2) .*(dY.blocks[j].blocks .+ blocks_transpose.blocks)  #symmetrize
+
+            #ignore error bounds
+            # Arblib.get_mid!.(dY.blocks[j].blocks,dY.blocks[j].blocks)
+            # Arblib.get_mid!.(dX.blocks[j].blocks,dX.blocks[j].blocks)
         end
     end
 
@@ -938,23 +1136,34 @@ end
 """Compute the step length min(γ α(M,dM), 1), where α is the maximum number step
 to which keeps M+α(M,dM) dM positive semidefinite"""
 function compute_step_length(M::BlockDiagonal,dM::BlockDiagonal,gamma)
-    # per block:
-    chol = [cholesky.(m.blocks) for m in blocks(M)]
-    min_eig = [T(Inf) for j=1:length(chol)]
-    Threads.@threads for j in 1:length(chol)
-        for l in 1:length(chol[j])
-            #LML should be symmetric. Not always in last few digits, so symmetrizing it
-            #eigmin(Symmetric(LML)) throws an error
-            LML = chol[j][l].L \ dM.blocks[j].blocks[l] / chol[j][l].U
-            min_eig[j] = min(eigmin(1/T(2)*(LML+LML')), min_eig[j])
+    # # cholb = [[cholesky(T.(m.blocks[l])) for l=1:length(m.blocks)] for m in blocks(M)]
+    min_eig = [T(Inf) for j=1:length(M.blocks)]
+
+    # min_eig = [Arb(Inf) for j=1:length(M.blocks)]
+    # println("ev")
+    Threads.@threads for j in 1:length(M.blocks)
+        for l in 1:length(M.blocks[j].blocks)
+            # chol = similar(M.blocks[j].blocks[l])
+            # Arblib.cho!(chol,M.blocks[j].blocks[l])
+            # LML = similar(dM.blocks[j].blocks[l])
+            # Arblib.approx_solve_tril!(LML, chol, dM.blocks[j].blocks[l],0) #LML = chol^-1 dMblock
+            # Arblib.transpose!(LML,LML)
+            # tempLML = similar(LML)
+            # Arblib.approx_solve_tril!(tempLML, chol, LML,0) #temp LML = chol^-1 (chol^-1 dMblock)^T = chol^-1
+            # eigenvalues = AcbVector(size(LML,1))
+            # Arblib.approx_eig_qr!(eigenvalues,AcbMatrix(tempLML))
+            # min_eig[j] = min(real.(eigenvalues)..., min_eig[j])
+            cholb = cholesky(T.(M.blocks[j].blocks[l]))
+            LMLb = cholb.L \ T.(dM.blocks[j].blocks[l]) / cholb.U
+            min_eig[j] = min(eigmin((LMLb+LMLb')/2), min_eig[j])
         end
     end
     min_eig = min(min_eig...)
 
     if min_eig > -gamma
-        return T(1)
+        return Arb(1,prec=precision(BigFloat))
     else
-        return -gamma/T(min_eig)
+        return Arb(-gamma/min_eig,prec=precision(BigFloat))
     end
 end
 
