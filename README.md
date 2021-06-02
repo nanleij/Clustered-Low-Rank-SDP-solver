@@ -1,5 +1,5 @@
 # Clustered-Low-Rank-SDP-solver
-An SDP solver exploiting structures of clusters of constraints and low-rank of the constraint matrices. This is a more general version of SDPB (TODO: add link), and part of the MSc thesis (TODO: add link).
+An SDP solver exploiting structures of clusters of constraints and low-rank of the constraint matrices. This is a more general version of SDPB (https://github.com/davidsd/sdpb), and part of the MSc thesis (http://resolver.tudelft.nl/uuid:53e114a8-61cd-4f48-8151-76abb0159408).
 
 (TODO: add program it solves)
 
@@ -17,5 +17,3 @@ Using multiple threads is supported. For small problems, this might not give a s
 - `GenericSVD`
 - `GenericLinearAlgebra`
 
-# References
-TODO: add main references
