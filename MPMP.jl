@@ -180,7 +180,7 @@ function create_sample_points_1d(d)
 end
 
 function create_sample_points_chebyshev(d,a=-1,b=1)
-    #roots of chebyshev polynomials of the first kind
+    #roots of chebyshev polynomials of the first kind, unisolvent for polynomials up to degree d
     return [(a+b)/BigFloat(2) + (b-a)/BigFloat(2) * cos((2k-1)/BigFloat(2(d+1))*BigFloat(pi)) for k=1:d+1]
 end
 
@@ -223,7 +223,8 @@ function prepareabc(M, # Vector of matrix polynomials
                     q, # Vector of polynomials
                     x, # Vector of points
                     δ = -1,# maximum degree. negative numbers-> use 2* the total degree of q[end]
-                    Pi = nothing)  #polynomial matrices, as much as G has. We will use A_(jrsk) = sum_l Tr(Q ⊗ E_rs) where Q = ∑_η λ_η(x_k)(√G[l](x_k)q(x_k) ⊗ v_η(x_k)) (√G[l](x_k)q(x_k) ⊗ v_η(x_k))^T
+                    Pi = nothing;
+                    prec = precision(BigFloat))  #polynomial matrices, as much as G has. We will use A_(jrsk) = sum_l Tr(Q ⊗ E_rs) where Q = ∑_η λ_η(x_k)(√G[l](x_k)q(x_k) ⊗ v_η(x_k)) (√G[l](x_k)q(x_k) ⊗ v_η(x_k))^T
                     #So λ_η sign(G[l](x_k)) is stored in A_sign[l,k][η] = H_(l,k,η), and the vectors (√G[l](x_k)q(x_k) ⊗ v_η(x_k)) in A[l,k][η]
     # Assumptions:
     # 1) all elements of M are the same size (true for a constraint)
@@ -244,34 +245,82 @@ function prepareabc(M, # Vector of matrix polynomials
     else
         #use SVD to get eigenvalues and vectors. getting eigenvectors for bigfloatmatrices is not possible with eigen(M) or eigvecs(M)
         svd_decomps = [svd([Pi[l][i,j](x[k]...) for i=1:size(Pi[l],1), j=1:size(Pi[l],2)]) for l=1:length(G), k=1:length(x)]
-        Pi_vecs = [ [svd_decomps[l,k].U[r,:] for r=1:size(Pi[l],1)] for l=1:length(G), k=1:length(x)]
-        Pi_vals = [ [dot(svd_decomps[l,k].U[r,:],svd_decomps[l,k].Vt[r,:])*svd_decomps[l,k].S[r] for r=1:size(Pi[l],1)] for l=1:length(G), k=1:length(x)]
+        Pi_vecs = [ [svd_decomps[l,k].U[:,r] for r=1:size(Pi[l],1)] for l=1:length(G), k=1:length(x)]
+        Pi_vals = [ [sign(dot(svd_decomps[l,k].U[:,r],svd_decomps[l,k].Vt[:,r]))*svd_decomps[l,k].S[r] for r=1:size(Pi[l],1)] for l=1:length(G), k=1:length(x)]
         deg_Pi = [max([total_degree(Pi[l][i,j]) for i=1:size(Pi[l],1) for j=1:size(Pi[l],2)]...) for l=1:length(G)]
+        #extra check: sum(pi_vals* pi_vecs*pi_vecs^T) = pi
+        max_dif = 0
+        index = [0,0,0,0]
+        for k=1:length(x)
+            for l=1:length(G)
+                for i=1:size(Pi[l],1)
+                    for j=1:size(Pi[l],2)
+                        #test whether we correctly decomposed Pi[l][i,j][x[k]...]
+                        cur_dif = Pi[l][i,j](x[k]...)
+                        for r=1:size(Pi[l],1)
+                            cur_dif -= Pi_vecs[l,k][r][i]*Pi_vecs[l,k][r][j]*Pi_vals[l,k][r]
+                        end
+                        if abs(cur_dif)>10^(-10)
+                            println([Pi[l][i,j](x[k]...) for i=1:size(Pi[l],1),j=1:size(Pi[l],1)])
+                            println(cur_dif)
+                            println(k,l,i,j)
+                        end
+                        if abs(cur_dif)>max_dif
+                            max_dif = abs(cur_dif)
+                            index = [k,l,i,j]
+                        end
+                    end
+                end
+            end
+        end
+        if max_dif>0
+            println(max_dif,index)
+        end
     end
 
-    # find the first occurance of a degree in the basis. Needed for symmetries, where the number of required basis polynomials can be (much) smaller than (n+d choose d)
-    #
+    # find the last occurance of a degree in the basis.
+    # Needed for symmetries, where the number of required basis polynomials can be (much) smaller than (n+d choose d)
     degrees = ones(Int64,div(δ,2)+1) #maximum degree needed is δ/2. everything is an index, so at least 1
     cur_deg = 0
-    for d = 1:length(q)
-        if total_degree(q[d])>cur_deg
-            degrees[cur_deg+1] = d-1
-            cur_deg+=1
-            if cur_deg+1 > length(degrees) #only need degrees up to div(δ,2)
-                break
-            end
-        elseif total_degree(q[d])<cur_deg-1 || total_degree(q[d])>cur_deg #degree can be cur_degree-1 (still basis for prev part) or cur_degree (start of basis for new part)
-            println("Something might be wrong, the degree of q is not monotone increasing with steps of 1")
-        end
-        if d == length(q) && total_degree(q[d]) == cur_deg #at the end, with maximum degree
-            degrees[cur_deg+1] = d
+    all_degrees = [total_degree(q[i]) for i=1:length(q)]
+    #check for monotonicity:
+    for i=1:length(all_degrees)-1
+        if all_degrees[i] > all_degrees[i+1]
+            println("Degrees are not monotone. The program will (most probably) not be correct if you don't fix this")
         end
     end
+    last_deg = [findlast(x->x==i,all_degrees) for i=0:div(δ,2)] #at place d+1: the last last index i such that deg(q[i]) = d
+    #change the nothings into the previous one
+    for i=1:length(last_deg)
+        if isnothing(last_deg[i])
+            last_deg[i] = last_deg[i-1] #always works if 1 is the first entry and the degrees are monotone
+        end
+    end
+    # for i = 1:length(q)
+    #     if total_degree(q[i]) == cur_deg +1
+    #         #the polynomial at place i has larger degree;
+    #         #we havent increased the cur_degree yet so this is the first occurance
+    #         # hence i-1 is the last entry with polynomial of degree cur_deg
+    #         degrees[cur_deg+1] = i-1
+    #         cur_deg+=1
+    #         if cur_deg+1 > length(degrees)
+    #             #we only need degrees up to div(δ,2)
+    #             #allowing cur_deg+1>length(degrees) would also raise an index error
+    #             break
+    #         end
+    #     elseif total_degree(q[i])<cur_deg || total_degree(q[i])>cur_deg+1
+    #         #degree can be cur_degree (still basis for prev part) or cur_degree+1 (start of basis for new part)
+    #         println("Something might be wrong, the degree of q is not monotone increasing with steps of 1")
+    #     end
+    #     if i == length(q) && total_degree(q[i]) == cur_deg #at the end, with maximum degree
+    #         degrees[cur_deg+1] = i
+    #     end
+    # end
     # println(degrees)
     # We can even put the whole G[l](x[k]...) in the 'sign'. We already have the eigenvalues of the Pi there
     # either way, better to be consistent (either also G in A_sign, or only the signs -> ev of Pi in A)
-    A_sign = [[Arb(Pi_vals[l,k][r]*sign(G[l](x[k]...)),prec=precision(BigFloat)) for r=1:length(Pi_vals[l,k])] for l=1:length(G),k=1:length(x)]
-    A = [ [ArbMatrix(kron([q[d](x[k]...)*sqrt(abs(G[l](x[k]...))) for d=1:degrees[div(δ-total_degree(G[l])-deg_Pi[l],2)+1]],Pi_vecs[l,k][r]),prec=precision(BigFloat)) for r=1:length(Pi_vecs[l,k])] for l=1:length(G), k=1:length(x)]
+    A_sign = [[Arb(Pi_vals[l,k][r]*sign(G[l](x[k]...)),prec=prec) for r=1:length(Pi_vals[l,k])] for l=1:length(G),k=1:length(x)]
+    A = [ [ArbMatrix(kron([q[d](x[k]...)*sqrt(abs(G[l](x[k]...))) for d=1:last_deg[div(δ-total_degree(G[l])-deg_Pi[l],2)+1]],Pi_vecs[l,k][r]),prec=prec) for r=1:length(Pi_vecs[l,k])] for l=1:length(G), k=1:length(x)]
     # println(degrees,q)
     # println(length(A[1,1][1]))
     # println(div(δ,2))
@@ -279,11 +328,11 @@ function prepareabc(M, # Vector of matrix polynomials
     # A[l,k][r] is the vector v_{j,l,k,r} for this constraint j
     # A_sign[l,k][r] gives the sign and the r'th eigenvalue of Pi. i.e Q = \sum_r A_sign[l,k][r] A[l,k][r] *A[l,k][r]'
 
-    B = ArbMatrix(vcat([transpose([T(-M[i][r,s](x[k]...)) for i=2:length(M)]) for r=1:m for s=1:r for k=1:length(x)]...))
+    B = ArbMatrix(vcat([transpose([T(-M[i][r,s](x[k]...)) for i=2:length(M)]) for r=1:m for s=1:r for k=1:length(x)]...),prec=prec)
 
-    c = ArbMatrix(vcat([[T(M[1][r,s](x[k]...))] for r=1:m for s=1:r for k=1:length(x)]...))
-    @assert precision(B) == precision(BigFloat)
-    @assert precision(c) == precision(BigFloat)
+    c = ArbMatrix(vcat([[T(M[1][r,s](x[k]...))] for r=1:m for s=1:r for k=1:length(x)]...),prec=prec)
+    @assert precision(B) == prec
+    @assert precision(c) == prec
     # println(size(B))
     return A, B, c, A_sign
 end
@@ -357,7 +406,7 @@ LinearAlgebra.dot(x::ArbMatrix,y::ArbMatrix) = Arblib.approx_dot!(Arb(0,prec=pre
 function solverank1sdp(constraints, # list of (A,B,c,H) tuples (ArbMatrices)
                        b, # Objective vector
                        blockinfo; # information about the block sizes etc.
-                       C=0, b0 = 0, maxiterations=500,
+                       C=0, b0 = 0, maxiterations=150,
                        beta_infeas = T(3)/10, #try to improve optimality by a factor 1/0.3
                        beta_feas= T(1)/10, # try to improve optimality by a factor 10
                        gamma =  T(7)/10, #what fraction of the maximum step size is used
@@ -375,6 +424,7 @@ function solverank1sdp(constraints, # list of (A,B,c,H) tuples (ArbMatrices)
     b = ArbMatrix(b,prec=precision(BigFloat))
     omega_p,omega_d,gamma,beta_feas,beta_infeas,b0,duality_gap_threshold,primal_error_threshold,dual_error_threshold = (
     Arb.([omega_p,omega_d,gamma,beta_feas,beta_infeas,b0,duality_gap_threshold,primal_error_threshold,dual_error_threshold],prec=precision(BigFloat)))
+
     #initialize:
     #1): choose initial point q = (0, Ω_p*I, 0, Ω_d*I) = (x,X,y,Y), with Ω>0
     #main loop:
@@ -392,13 +442,13 @@ function solverank1sdp(constraints, # list of (A,B,c,H) tuples (ArbMatrices)
     #Repeat from step 2
 
     #step 1: initialize.
-    if length(initial_solutions) == 0
+    if length(initial_solutions) != 4 #we need the whole solution, x,X,y,Y
         x = ArbMatrix(sum(blockinfo.dim_S),1,prec=precision(BigFloat)) # all tuples (j,r,s,k), equals size of S.
         X = BlockDiagonal([BlockDiagonal([ArbMatrix(Matrix{T}(T(omega_p)*I,blockinfo.Y_blocksizes[j][l],blockinfo.Y_blocksizes[j][l]),prec=precision(BigFloat)) for l=1:blockinfo.L[j]]) for j=1:blockinfo.J])
         y = ArbMatrix(blockinfo.n_y,1,prec=precision(BigFloat)) #first bigfloat then arbmatrix. Not that clean but okay
         Y = BlockDiagonal([BlockDiagonal([ArbMatrix(Matrix{T}(T(omega_d)*I,blockinfo.Y_blocksizes[j][l],blockinfo.Y_blocksizes[j][l]),prec=precision(BigFloat)) for l=1:blockinfo.L[j]]) for j=1:blockinfo.J])
     else
-        (x,X,y,Y) = initial_solutions
+        (x,X,y,Y) = copy.(initial_solutions)
     end
     if C == 0 #no C objective given. #in principle we can remove C in most cases. Only for computing residuals; not sure on the impact regarding memory (as it is always zero)
         # C = zero(Y) #make sure adding/subtracting C works in case it is 0.
@@ -834,7 +884,7 @@ end
 """Compute the vector Tr(A_* Z) for one or all constraints"""
 function trace_A(constraints,Z,blockinfo)
     #Assumption: Z is symmetric
-    result = ArbMatrix(sum(blockinfo.dim_S),1,prec=precision(BigFloat)) #precision is precision of T i.e. precision(BigFloat)
+    result = ArbMatrix(sum(blockinfo.dim_S),1,prec=precision(BigFloat))
     #one entry for each (j,r,s,k) tuple
     # println("trace A gen")
     Threads.@threads for j=1:blockinfo.J
@@ -868,20 +918,21 @@ function trace_A(constraints,Z,blockinfo)
 end
 
 function trace_A(constraint,Z,blockinfo,j)
-    #Assumption: Z is symmetric
+    #Assumption: Z is symmetric. Tr(Z λvv^T 1/2(e_r e_s + e_s e_r)) =1/2 λ(Tr(Z[r,s]vv^T +Z[s,r]vv^T)) = λv^TZ[r,s]v
     result = ArbMatrix(sum(blockinfo.dim_S[j]),1,prec = precision(BigFloat))
     tup_idx = 1
+    #we can do this threaded (over n_samples for example) by calculating tup_idx instead of doing +1 every iteration
     for r = 1:blockinfo.m[j]
         for s=1:r
             for k=1:blockinfo.n_samples[j]
                 for l=1:blockinfo.L[j]
                     for rnk=1:blockinfo.ranks[j][l]
-                        v = constraint[1][l,k][rnk] #we might want to store constraints things as arbmatrices...
+                        v = constraint[1][l,k][rnk]
                         delta = length(v)
                         v_transpose = ArbMatrix(1,delta,prec=precision(BigFloat))
                         Arblib.transpose!(v_transpose,v)
                         sgn = constraint[4][l,k][rnk]
-                        result[tup_idx,1]+= sgn*(v_transpose*Z.blocks[l][(r-1)*delta+1:r*delta,(s-1)*delta+1:s*delta]*v)[1,1]
+                        result[tup_idx,1] += sgn*(v_transpose*Z.blocks[l][(r-1)*delta+1:r*delta,(s-1)*delta+1:s*delta]*v)[1,1]
                     end
                 end
                 tup_idx +=1
